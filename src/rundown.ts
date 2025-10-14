@@ -1,30 +1,29 @@
-import {
-	ElementId,
-	ExternalElement,
-	ExternalElementId,
-	InternalElement,
-	InternalElementId,
-	InternalElementIdWithCreator,
-	isExternalElement,
-	isInternalElement,
-	VElement,
-	VRundown,
-	VTemplate,
-} from './v-connection'
+import { MSERep } from './mse'
 import { CommandResult, createHTTPContext, HttpMSEClient, HTTPRequestError } from './msehttp'
-import { getPepErrorMessage, InexistentError, LocationType, PepResponse } from './peptalk'
-import { CREATOR_NAME, MSERep } from './mse'
-import { AtomEntry, FlatEntry, flattenEntry } from './xml'
-import * as uuid from 'uuid'
+import { getPepErrorMessage, InexistentError, PepResponse } from './peptalk'
 import { has, wrapInBracesIfNeeded } from './util'
+import { ElementId, ExternalElement, PlaylistGroup, VElement, VRundown, VTemplate } from './v-connection'
+import { AtomEntry, FlatEntry, flattenEntry } from './xml'
 
-interface ExternalElementInfo {
+interface ElementInfo {
 	vcpid: number
 	channel?: string
 	refName: string
+	refPath?: string
+	name?: string
+	description?: string
 }
 
 const ALTERNATIVE_CONCEPT = 'alternative_concept'
+
+interface PlaylistResponse {
+	elements?: {
+		group?: Array<{
+			$: { name: string; description: string }
+			ref: Array<{ $: { name: string }; _: string }> | { $: { name: string }; _: string }
+		}>
+	}
+}
 
 export class Rundown implements VRundown {
 	readonly playlist: string
@@ -36,8 +35,9 @@ export class Rundown implements VRundown {
 		return this.mse.getPep()
 	}
 	private msehttp: HttpMSEClient
-	private channelMap: Record<string, ExternalElementInfo> = {}
-	private initialChannelMapPromise: Promise<any>
+	private elementMap: Record<string, ElementInfo> = {}
+	private initialElementMapPromise: Promise<boolean> | null = null
+	private buildingElementMap = false
 
 	constructor(mseRep: MSERep, profile: string, playlist: string, description: string) {
 		this.mse = mseRep
@@ -55,15 +55,22 @@ export class Rundown implements VRundown {
 			this.mse.resthost ? this.mse.resthost : this.mse.hostname,
 			this.mse.restPort
 		)
-		this.initialChannelMapPromise = this.buildChannelMap().catch((err) =>
-			this.mse.emit('warning', `Failed to build channel map: ${err.message}`)
-		)
+
+		// Initialize element map when the rundown is created
+		// This will run asynchronously in the background
+		this.initialElementMapPromise = this.buildElementMap()
+			.then((result) => {
+				console.log('Initial element map built with size:', Object.keys(this.elementMap).length)
+				return result
+			})
+			.catch((err) => {
+				console.error('Failed to build initial element map:', getPepErrorMessage(err))
+				return false
+			})
 	}
 
 	private static makeKey(elementId: ElementId) {
-		return isExternalElement(elementId)
-			? `${elementId.vcpid}_${elementId.channel ?? ''}`
-			: `${elementId.showId}_${elementId.instanceName}`
+		return `${elementId.vcpid}_${elementId.channel ?? ''}`
 	}
 	private static makeKeySet(elementIds: ElementId[]): Set<string> {
 		return new Set(
@@ -73,37 +80,182 @@ export class Rundown implements VRundown {
 		)
 	}
 
-	private async buildChannelMap(elementId?: ExternalElementId): Promise<boolean> {
-		if (elementId && has(this.channelMap, Rundown.makeKey(elementId))) {
+	private async buildElementMap(elementId?: ElementId): Promise<boolean> {
+		console.log('buildElementMap called', elementId)
+
+		// If we're looking for a specific element and it's already in the map, return immediately
+		if (elementId && has(this.elementMap, Rundown.makeKey(elementId))) {
+			console.log('Element already in map, returning immediately')
 			return true
 		}
-		await this.mse.checkConnection()
-		const elements = elementId ? [elementId] : await this.listExternalElements()
-		for (const e of elements) {
-			if (typeof e !== 'string') {
-				const element = await this.getElement(e)
-				this.channelMap[Rundown.makeKey(e)] = {
-					vcpid: e.vcpid,
-					channel: element.channel,
-					refName: has(element, 'name') && typeof element.name === 'string' ? element.name : 'ref',
-				}
+
+		// If we're already building the map, wait for that to complete
+		if (this.buildingElementMap) {
+			console.log('Element map build already in progress, waiting...')
+			// Wait a bit and check if the element is in the map
+			await new Promise((resolve) => setTimeout(resolve, 500))
+			if (elementId && has(this.elementMap, Rundown.makeKey(elementId))) {
+				console.log('Element appeared in map while waiting')
+				return true
+			}
+			// Wait a bit longer for the build to complete
+			await new Promise((resolve) => setTimeout(resolve, 1500))
+			if (elementId && has(this.elementMap, Rundown.makeKey(elementId))) {
+				console.log('Element appeared in map after waiting longer')
+				return true
 			}
 		}
-		return elementId ? has(this.channelMap, Rundown.makeKey(elementId)) : false
-	}
 
-	private ref(elementId: ExternalElementId, unescape = false): string {
-		const key = Rundown.makeKey(elementId)
-		let str = this.channelMap[key]?.refName || 'ref'
+		// Set the building flag
+		this.buildingElementMap = true
 
-		if (unescape) {
-			// Return the unescaped string
-			str = str.replace('%23', '#')
-		} else {
-			// Return the escaped string
-			str = str.replace('#', '%23')
+		try {
+			await this.mse.checkConnection()
+
+			// Only handle external elements
+			if (!elementId) {
+				// If we're looking for a specific element, just process that one
+				// Otherwise, try to get all external elements with retries if needed
+				let externalElements: ElementId[]
+
+				if (elementId) {
+					externalElements = [elementId]
+				} else {
+					// Add a small delay before the first attempt to ensure the system is ready
+					console.log('Waiting before fetching external elements...')
+					await new Promise((resolve) => setTimeout(resolve, 1000))
+
+					// Try up to 3 times to get a complete list of external elements
+					let attempts = 0
+					const maxAttempts = 3
+					externalElements = []
+
+					while (attempts < maxAttempts) {
+						attempts++
+						externalElements = await this.listExternalElements()
+
+						// If we got more than one element, break
+						if (externalElements.length > 1) {
+							break
+						}
+
+						// If we've reached max attempts, break
+						if (attempts >= maxAttempts) {
+							break
+						}
+
+						// Wait a bit before retrying, with increasing delay
+						console.log('Got only one element, retrying after delay...')
+						await new Promise((resolve) => setTimeout(resolve, 1000 * attempts))
+					}
+				}
+
+				// If we didn't get any elements and we're not looking for a specific one,
+				// there might be an issue with the connection or data
+				if (externalElements.length === 0 && !elementId) {
+					console.log('Warning: No external elements found')
+				}
+
+				// Get the playlist elements to extract refPath
+				const playlistElementsList = await this.pep.getJS(
+					`/storage/playlists/${wrapInBracesIfNeeded(this.playlist)}/elements`,
+					4
+				)
+				const flatPlaylistElements: FlatEntry = await flattenEntry(playlistElementsList.js as AtomEntry)
+
+				// Helper function to find refPath for an element
+				const findRefPath = (obj: any, vcpid: number): string | undefined => {
+					// Base case: not an object or null
+					if (!obj || typeof obj !== 'object') {
+						return undefined
+					}
+
+					// Check if this is a direct reference with the matching vcpid
+					if (obj.value && typeof obj.value === 'string' && obj.value.includes(`/elements/${vcpid}`)) {
+						return obj.value
+					}
+
+					// Check if this is a reference with the matching path in _
+					if (obj._ && typeof obj._ === 'string' && obj._.includes(`/elements/${vcpid}`)) {
+						return obj._
+					}
+
+					// Recursively search all properties
+					for (const key in obj) {
+						// Skip certain properties that we know aren't relevant
+						if (key === 'name' || key === 'id' || key === 'status') continue
+
+						// Handle arrays
+						if (Array.isArray(obj[key])) {
+							for (const item of obj[key]) {
+								const result = findRefPath(item, vcpid)
+								if (result) return result
+							}
+						}
+						// Handle nested objects
+						else if (typeof obj[key] === 'object') {
+							const result = findRefPath(obj[key], vcpid)
+							if (result) return result
+						}
+					}
+
+					return undefined
+				}
+
+				// Process each external element and add it to the elementMap
+				for (const e of externalElements) {
+					if (typeof e !== 'string') {
+						try {
+							const refPath = findRefPath(flatPlaylistElements, e.vcpid)
+
+							// Try to get the element details, but don't fail if we can't
+							let element: VElement | undefined
+							try {
+								element = await this.getElement(e)
+							} catch (err) {
+								console.log(`Could not get element details for ${e.vcpid}: ${getPepErrorMessage(err)}`)
+							}
+
+							// Always use 'ref' as the reference name
+							this.elementMap[Rundown.makeKey(e)] = {
+								vcpid: e.vcpid,
+								channel: element?.channel || e.channel,
+								refName: 'ref',
+								refPath,
+							}
+						} catch (err) {
+							// If we can't get the element, create a default entry
+							const refPath = findRefPath(flatPlaylistElements, e.vcpid)
+							this.elementMap[Rundown.makeKey(e)] = {
+								vcpid: e.vcpid,
+								channel: e.channel,
+								refName: 'ref',
+								refPath,
+							}
+							console.log(`Created default entry for ${e.vcpid}: ${getPepErrorMessage(err)}`)
+						}
+					}
+				}
+			}
+
+			console.log('elementMap size:', Object.keys(this.elementMap).length)
+			if (Object.keys(this.elementMap).length > 0) {
+				console.log(
+					'elementMap sample:',
+					Object.keys(this.elementMap)
+						.slice(0, 5)
+						.map((key) => {
+							const info = this.elementMap[key]
+							return 'vcpid' in info ? `${info.vcpid}:${info.refPath?.slice(-20) || 'no-path'}` : key
+						})
+				)
+			}
+
+			return elementId ? has(this.elementMap, Rundown.makeKey(elementId)) : true
+		} finally {
+			// Always reset the building flag when done
+			this.buildingElementMap = false
 		}
-		return str
 	}
 
 	async listTemplates(showId: string): Promise<string[]> {
@@ -115,7 +267,9 @@ export class Rundown implements VRundown {
 
 	async getTemplate(templateName: string, showId: string): Promise<VTemplate> {
 		await this.mse.checkConnection()
-		const template = await this.pep.getJS(`/storage/shows/{${showId}}/mastertemplates/${templateName}`)
+		const template = await this.pep.getJS(
+			`/storage/shows/${wrapInBracesIfNeeded(showId)}/mastertemplates/${templateName}`
+		)
 		let flatTemplate = await flattenEntry(template.js as AtomEntry)
 		if (Object.keys(flatTemplate).length === 1) {
 			flatTemplate = flatTemplate[Object.keys(flatTemplate)[0]] as FlatEntry
@@ -123,162 +277,159 @@ export class Rundown implements VRundown {
 		return flatTemplate as VTemplate
 	}
 
-	async createElement(
-		elementId: InternalElementId,
-		templateName: string,
-		textFields: string[],
-		channel?: string
-	): Promise<InternalElement>
-	async createElement(elementId: ExternalElementId): Promise<ExternalElement>
-	async createElement(
-		elementId: ElementId,
-		templateName?: string,
-		textFields?: string[],
-		channel?: string
-	): Promise<VElement> {
-		// TODO ensure that a playlist is created with sub-element "elements"
-		if (isInternalElement(elementId)) {
-			await this.assertInternalElementDoesNotExist(elementId)
-			return this.createInternalElement(elementId, templateName as string, textFields as string[], channel)
-		} else {
-			await this.checkChannelMapWasBuilt()
-			await this.assertExternalElementDoesNotExist(elementId)
-			return this.createExternalElement(elementId)
-		}
-	}
-
-	private async assertInternalElementDoesNotExist(elementId: InternalElementId) {
-		try {
-			await this.getElement(elementId)
-			throw new Error(`An internal graphics element with name '${elementId.instanceName}' already exists.`)
-		} catch (err) {
-			if (getPepErrorMessage(err).startsWith('An internal graphics element')) throw err
-		}
-	}
-
-	private async createInternalElement(
-		elementId: InternalElementId,
-		templateName: string,
-		textFields: string[],
-		channel?: string
-	): Promise<InternalElement> {
-		const template = await this.getTemplate(templateName, elementId.showId)
-		// console.dir((template[nameOrID] as any).model_xml.model.schema[0].fielddef, { depth: 10 })
-		let fielddef
-		if (this.hasModel(template)) {
-			fielddef = (template as any).model_xml.model.schema[0].fielddef
-		} else {
-			throw new Error(
-				`Could not retrieve field definitions for template '${templateName}'. Not creating element '${elementId.instanceName}'.`
-			)
-		}
-		let fieldNames: string[] = fielddef ? fielddef.map((x: any): string => x.$.name) : []
-		let entries = ''
-		const data: { [name: string]: string } = {}
-		if (textFields.length > fieldNames.length) {
-			this.mse.emit(
-				'warning',
-				`For template '${templateName}' with ${fieldNames.length} field(s), ${textFields.length} fields have been provided.`
-			)
-		}
-		fieldNames = fieldNames.sort()
-		for (let x = 0; x < fieldNames.length; x++) {
-			entries += `    <entry name="${fieldNames[x]}">${textFields[x] ?? ''}</entry>\n`
-			data[fieldNames[x]] = textFields[x] ?? ''
-		}
-		const vizProgram = channel ? ` viz_program="${channel}"` : ''
-		await this.pep.insert(
-			`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`,
-			`<element name="${
-				elementId.instanceName
-			}" guid="${uuid.v4()}" updated="${new Date().toISOString()}" creator="${CREATOR_NAME}" ${vizProgram}>
-<ref name="master_template">/storage/shows/{${elementId.showId}}/mastertemplates/${templateName}</ref>
-<entry name="default_alternatives"/>
-<entry name="data">
-${entries}
-</entry>
-</element>`,
-			LocationType.Last
-		)
-		return {
-			name: elementId.instanceName,
-			template: templateName,
-			data,
-			channel,
-		}
-	}
-
-	private hasModel(template: VTemplate) {
-		return (
-			has(template, 'model_xml') &&
-			typeof template.model_xml === 'object' &&
-			has(template.model_xml, 'model') &&
-			typeof template.model_xml.model === 'object'
-		)
-	}
-
-	private async assertExternalElementDoesNotExist(elementId: ExternalElementId) {
-		try {
-			await this.getElement(elementId)
-			throw new Error(`An external graphics element with name '${elementId.vcpid}' already exists.`)
-		} catch (err) {
-			if (getPepErrorMessage(err).startsWith('An external graphics element')) throw err
-		}
-	}
-
-	private async checkChannelMapWasBuilt() {
-		try {
-			await this.initialChannelMapPromise
-		} catch (err) {
-			this.mse.emit('warning', `createElement: Channel map not built: ${getPepErrorMessage(err)}`)
-		}
-	}
-
-	private async createExternalElement(elementId: ExternalElementId): Promise<ExternalElement> {
-		const vizProgram = elementId.channel ? ` viz_program="${elementId.channel}"` : ''
-		const { body: path } = await this.pep.insert(
-			`/storage/playlists/{${this.playlist}}/elements/`,
-			`<ref available="0.00" loaded="0.00" take_count="0"${vizProgram}>/external/pilotdb/elements/${elementId.vcpid}</ref>`,
-			LocationType.Last
-		)
-		this.channelMap[Rundown.makeKey(elementId)] = {
-			vcpid: elementId.vcpid,
-			channel: elementId.channel,
-			refName: path ? path.slice(path.lastIndexOf('/') + 1) : 'ref',
-		}
-		return {
-			vcpid: elementId.vcpid.toString(),
-			channel: elementId.channel,
-		}
-	}
-
-	async listInternalElements(showId: string): Promise<InternalElementIdWithCreator[]> {
+	async listExternalElements(): Promise<Array<ElementId>> {
 		await this.mse.checkConnection()
-		const pepResponseJS = await this.pep.getJS(`/storage/shows/${wrapInBracesIfNeeded(showId)}/elements`, 1)
-		const flatEntry: FlatEntry = await flattenEntry(pepResponseJS.js as AtomEntry)
-		const elementsParentNode = flatEntry['elements'] as FlatEntry
-		return Object.keys(elementsParentNode)
-			.filter((x) => x !== 'name')
-			.map((elementName) => ({
-				instanceName: elementName,
-				showId,
-				creator: (elementsParentNode[elementName] as FlatEntry).creator as string | undefined,
-			}))
-	}
 
-	async listExternalElements(): Promise<Array<ExternalElementId>> {
-		await this.mse.checkConnection()
-		const playlistElementsList = await this.pep.getJS(`/storage/playlists/{${this.playlist}}/elements`, 2)
+		// First, ensure we have a fresh connection
+		//console.log('Fetching external elements from playlist:', this.playlist)
+
+		const playlistElementsList = await this.pep.getJS(
+			`/storage/playlists/${wrapInBracesIfNeeded(this.playlist)}/elements`,
+			4
+		)
 		const flatPlaylistElements: FlatEntry = await flattenEntry(playlistElementsList.js as AtomEntry)
-		const elementsRefs = flatPlaylistElements.elements
-			? Object.keys(flatPlaylistElements.elements as FlatEntry).map((k) => {
-					const entry = (flatPlaylistElements.elements as FlatEntry)[k] as FlatEntry
-					const ref = entry.value as string
+
+		const elementsRefs: ElementId[] = []
+
+		// Helper function to process entries recursively
+		const processEntry = (entry: any, depth = 0) => {
+			// Base case: not an object or null
+			if (!entry || typeof entry !== 'object') {
+				return
+			}
+
+			// Handle direct references
+			if (entry.key === 'ref' && entry.value) {
+				const ref = entry.value as string
+				if (ref.includes('/elements/')) {
 					const lastSlash = ref.lastIndexOf('/')
-					return { vcpid: +ref.slice(lastSlash + 1), channel: entry.viz_program as string | undefined }
-			  })
-			: []
-		return elementsRefs
+					elementsRefs.push({
+						vcpid: +ref.slice(lastSlash + 1),
+						channel: entry.viz_program as string | undefined,
+					})
+				}
+			}
+			// Handle groups
+			else if (entry.key === 'group') {
+				// Process refs directly in this group
+				if (entry.ref) {
+					const refs = Array.isArray(entry.ref) ? entry.ref : [entry.ref]
+					for (const groupRef of refs) {
+						if (groupRef.value) {
+							const ref = groupRef.value as string
+							if (ref.includes('/elements/')) {
+								const lastSlash = ref.lastIndexOf('/')
+								elementsRefs.push({
+									vcpid: +ref.slice(lastSlash + 1),
+									channel: groupRef.viz_program as string | undefined,
+								})
+							}
+						} else if (groupRef._ && typeof groupRef._ === 'string' && groupRef._.includes('/elements/')) {
+							const ref = groupRef._
+							const lastSlash = ref.lastIndexOf('/')
+							elementsRefs.push({
+								vcpid: +ref.slice(lastSlash + 1),
+								channel: (groupRef.$ && groupRef.$.viz_program) as string | undefined,
+							})
+						}
+					}
+				}
+
+				// Process nested entries
+				for (const key in entry) {
+					if (typeof entry[key] === 'object' && entry[key] !== null && key !== 'ref') {
+						processEntry(entry[key], depth + 1)
+					}
+				}
+			}
+			// Process all other properties recursively
+			else {
+				for (const key in entry) {
+					// Skip certain properties that we know aren't relevant
+					if (key === 'name' || key === 'id' || key === 'status') continue
+
+					// Handle arrays
+					if (Array.isArray(entry[key])) {
+						for (const item of entry[key]) {
+							processEntry(item, depth + 1)
+						}
+					}
+					// Handle nested objects
+					else if (typeof entry[key] === 'object' && entry[key] !== null) {
+						processEntry(entry[key], depth + 1)
+					}
+					// Check if this is a string that contains a reference to an element
+					else if (typeof entry[key] === 'string' && entry[key].includes('/elements/')) {
+						const ref = entry[key] as string
+						const lastSlash = ref.lastIndexOf('/')
+						const vcpid = +ref.slice(lastSlash + 1)
+						if (!isNaN(vcpid) && vcpid > 0) {
+							elementsRefs.push({
+								vcpid,
+								channel: entry.viz_program as string | undefined,
+							})
+						}
+					}
+				}
+			}
+		}
+
+		// Process all elements
+		if (flatPlaylistElements.elements) {
+			processEntry(flatPlaylistElements.elements)
+		} else {
+			// If no elements property, try to process the whole object
+			processEntry(flatPlaylistElements)
+		}
+
+		// Remove duplicates by vcpid
+		const uniqueElements = Array.from(new Map(elementsRefs.map((item) => [item.vcpid, item])).values())
+
+		console.log(`Found ${uniqueElements.length} unique external elements`)
+		return uniqueElements
+	}
+
+	async listPilotDBExternalElements(): Promise<Array<PlaylistGroup>> {
+		await this.mse.checkConnection()
+		const playlistElementsList = await this.pep.getJS(
+			`/storage/playlists/${wrapInBracesIfNeeded(this.playlist)}/elements`,
+			3
+		)
+
+		// Parse the groups and their elements
+		const groups: PlaylistGroup[] = []
+		const groupList = (playlistElementsList.js as PlaylistResponse)?.elements?.group || []
+
+		for (const group of groupList) {
+			const groupElements = Array.isArray(group.ref) ? group.ref : [group.ref]
+			//console.log('groupElements', groupElements)
+			groups.push({
+				name: group.$.name,
+				description: group.$.description,
+				elements: (
+					await Promise.all(
+						groupElements.map(async (ref) => {
+							const refPath = ref._
+							const lastSlash = refPath.lastIndexOf('/')
+							const vcpid = +refPath.slice(lastSlash + 1)
+
+							if (!vcpid) return null
+							const elementInfo = await this.getExternalPilotDbElement({ vcpid })
+							return {
+								name: elementInfo[vcpid]?.description || ref.$.name,
+								vcpid,
+								ref: ref._,
+							}
+						})
+					)
+				).filter(
+					(element): element is { name: string; vcpid: number; text: string; ref: string } =>
+						element !== null && typeof element.vcpid === 'number'
+				),
+			})
+		}
+
+		return groups
 	}
 
 	async initializeShow(showId: string): Promise<CommandResult> {
@@ -286,43 +437,6 @@ ${entries}
 	}
 	async cleanupShow(showId: string): Promise<CommandResult> {
 		return this.msehttp.cleanupShow(showId)
-	}
-
-	async cleanupAllSofieShows(): Promise<CommandResult[]> {
-		const showIds: string[] = await this.findAllSofieShowIds()
-		await this.purgeInternalElements(showIds, false)
-		return Promise.all(showIds.map(async (showId) => this.cleanupShow(showId)))
-	}
-
-	private async findAllSofieShowIds(): Promise<string[]> {
-		await this.mse.checkConnection()
-		const pepResponseJS = await this.pep.getJS(`/storage/shows`, 1)
-		const shows: FlatEntry = await flattenEntry(pepResponseJS.js as AtomEntry)
-
-		const settledResultShowIds: PromiseSettledResult<string>[] = await Promise.allSettled(
-			Object.keys(shows).map(this.isSofieShow.bind(this))
-		)
-		return this.reduceSettledResultToShowIds(settledResultShowIds).map(this.stripCurlyBrackets.bind(this))
-	}
-
-	private async isSofieShow(showId: string): Promise<string> {
-		const elements: InternalElementIdWithCreator[] = await this.listInternalElements(showId)
-		return elements.find((element: InternalElementIdWithCreator) => element.creator === CREATOR_NAME)
-			? Promise.resolve(showId)
-			: Promise.reject()
-	}
-
-	private reduceSettledResultToShowIds(settledResultShowIds: PromiseSettledResult<string>[]): string[] {
-		return settledResultShowIds.reduce((showIds: string[], promise: PromiseSettledResult<string>) => {
-			if (promise.status === 'fulfilled') {
-				return [...showIds, promise.value]
-			}
-			return showIds
-		}, [] as string[])
-	}
-
-	private stripCurlyBrackets(value: string): string {
-		return value.replace('{', '').replace('}', '')
 	}
 
 	async activate(twice?: boolean, initPlaylist = true): Promise<CommandResult> {
@@ -346,107 +460,86 @@ ${entries}
 	}
 
 	async deleteElement(elementId: ElementId): Promise<PepResponse> {
-		if (isInternalElement(elementId)) {
-			return this.pep.delete(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
+		// Note: For some reason, in contrast to the other commands, the delete command only works with the path being unescaped:
+		const path = this.getExternalElementPath(elementId, true)
+		if (await this.buildElementMap(elementId)) {
+			return this.pep.delete(path)
 		} else {
-			// Note: For some reason, in contrast to the other commands, the delete command only works with the path being unescaped:
-			const path = this.getExternalElementPath(elementId, true)
-			if (await this.buildChannelMap(elementId)) {
-				return this.pep.delete(path)
-			} else {
-				throw new InexistentError(-1, path)
-			}
+			console.log('Not found', path)
+			throw new InexistentError(-1, path)
 		}
 	}
 
 	async cue(elementId: ElementId): Promise<CommandResult> {
-		if (isInternalElement(elementId)) {
-			return this.msehttp.cue(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
+		const path = this.getExternalElementPath(elementId)
+		if (await this.buildElementMap(elementId)) {
+			return this.msehttp.cue(path)
 		} else {
-			const path = this.getExternalElementPath(elementId)
-			if (await this.buildChannelMap(elementId)) {
-				return this.msehttp.cue(path)
-			} else {
-				throw new HTTPRequestError(
-					`Cannot cue external element as ID '${elementId.vcpid}' is not known in this rundown.`,
-					this.msehttp.baseURL,
-					path
-				)
-			}
+			throw new HTTPRequestError(
+				`Cannot cue external element as ID '${elementId.vcpid}' is not known in this rundown.`,
+				this.msehttp.baseURL,
+				path
+			)
 		}
 	}
 
 	async take(elementId: ElementId): Promise<CommandResult> {
-		if (isInternalElement(elementId)) {
-			return this.msehttp.take(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
-		} else {
-			const path = this.getExternalElementPath(elementId)
-			if (await this.buildChannelMap(elementId)) {
-				return this.msehttp.take(path)
-			} else {
-				throw new HTTPRequestError(
-					`Cannot take external element as ID '${elementId.vcpid}' is not known in this rundown.`,
-					this.msehttp.baseURL,
-					path
-				)
-			}
+		console.log('take', elementId)
+		try {
+			await this.buildElementMap(elementId)
+			const path = this.elementMap[Rundown.makeKey(elementId)]?.refPath || ''
+			return this.msehttp.take(path)
+		} catch (e) {
+			throw new HTTPRequestError(
+				`Cannot take external element as ID '${elementId.vcpid}' is not known in this rundown.`,
+				this.msehttp.baseURL,
+				this.elementMap[Rundown.makeKey(elementId)]?.refPath || ''
+			)
 		}
 	}
 
 	async continue(elementId: ElementId): Promise<CommandResult> {
-		if (isInternalElement(elementId)) {
-			return this.msehttp.continue(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
+		const path = this.getExternalElementPath(elementId)
+		if (await this.buildElementMap(elementId)) {
+			return this.msehttp.continue(path)
 		} else {
-			const path = this.getExternalElementPath(elementId)
-			if (await this.buildChannelMap(elementId)) {
-				return this.msehttp.continue(path)
-			} else {
-				throw new HTTPRequestError(
-					`Cannot continue external element as ID '${elementId.vcpid}' is not known in this rundown.`,
-					this.msehttp.baseURL,
-					path
-				)
-			}
+			throw new HTTPRequestError(
+				`Cannot continue external element as ID '${elementId.vcpid}' is not known in this rundown.`,
+				this.msehttp.baseURL,
+				path
+			)
 		}
 	}
 
 	async continueReverse(elementId: ElementId): Promise<CommandResult> {
-		if (isInternalElement(elementId)) {
-			return this.msehttp.continueReverse(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
+		const path = this.getExternalElementPath(elementId)
+		if (await this.buildElementMap(elementId)) {
+			return this.msehttp.continueReverse(path)
 		} else {
-			const path = this.getExternalElementPath(elementId)
-			if (await this.buildChannelMap(elementId)) {
-				return this.msehttp.continueReverse(path)
-			} else {
-				throw new HTTPRequestError(
-					`Cannot continue reverse external element as ID '${elementId.vcpid}' is not known in this rundown.`,
-					this.msehttp.baseURL,
-					path
-				)
-			}
+			throw new HTTPRequestError(
+				`Cannot continue reverse external element as ID '${elementId.vcpid}' is not known in this rundown.`,
+				this.msehttp.baseURL,
+				path
+			)
 		}
 	}
 
 	async out(elementId: ElementId): Promise<CommandResult> {
-		if (isInternalElement(elementId)) {
-			return this.msehttp.out(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
+		const path = this.getExternalElementPath(elementId)
+		if (await this.buildElementMap(elementId)) {
+			return this.msehttp.out(path)
 		} else {
-			const path = this.getExternalElementPath(elementId)
-			if (await this.buildChannelMap(elementId)) {
-				return this.msehttp.out(path)
-			} else {
-				throw new HTTPRequestError(
-					`Cannot take out external element as ID '${elementId.vcpid}' is not known in this rundown.`,
-					this.msehttp.baseURL,
-					path
-				)
-			}
+			throw new HTTPRequestError(
+				`Cannot take out external element as ID '${elementId.vcpid}' is not known in this rundown.`,
+				this.msehttp.baseURL,
+				path
+			)
 		}
 	}
 
-	async initialize(elementId: ExternalElementId): Promise<CommandResult> {
+	async initialize(elementId: ElementId): Promise<CommandResult> {
 		const path = this.getExternalElementPath(elementId)
-		if (await this.buildChannelMap(elementId)) {
+		if (await this.buildElementMap(elementId)) {
 			return this.msehttp.initialize(path)
 		} else {
 			throw new HTTPRequestError(
@@ -457,48 +550,27 @@ ${entries}
 		}
 	}
 
-	async purgeInternalElements(
-		showIds: string[],
-		onlyCreatedByUs?: boolean,
-		elementsToKeep: InternalElementId[] = []
-	): Promise<PepResponse> {
+	async purgeExternalElements(elementsToKeep: ElementId[] = []): Promise<PepResponse> {
+		await this.buildElementMap()
 		const elementsToKeepSet = Rundown.makeKeySet(elementsToKeep)
 
-		const elementsToDelete: InternalElementIdWithCreator[] = []
-		for (const showId of showIds) {
-			const elements = await this.listInternalElements(showId)
-			for (const element of elements) {
-				if (
-					(!onlyCreatedByUs || element.creator === CREATOR_NAME) &&
-					!elementsToKeepSet.has(Rundown.makeKey(element))
-				) {
-					elementsToDelete.push(element)
+		const deletePromises: Promise<void>[] = Object.keys(this.elementMap)
+			.filter((key) => {
+				const info = this.elementMap[key]
+				return 'vcpid' in info // Only process external elements
+			})
+			.map(async (key) => {
+				if (elementsToKeepSet.has(key)) return
+
+				try {
+					const info = this.elementMap[key]
+					await this.deleteElement({ vcpid: info.vcpid, channel: info.channel })
+				} catch (e) {
+					if (!(e instanceof InexistentError)) {
+						throw e
+					}
 				}
-			}
-		}
-
-		const deletePromises: Promise<any>[] = elementsToDelete.map(async (element) => this.deleteElement(element))
-		await Promise.allSettled(deletePromises) // Wait for all Promises
-		await Promise.all(deletePromises) // throw if there are any rejected Promises
-
-		return { id: '*', status: 'ok' } as PepResponse
-	}
-
-	async purgeExternalElements(elementsToKeep: ExternalElementId[] = []): Promise<PepResponse> {
-		await this.buildChannelMap()
-		const elementsToKeepSet = Rundown.makeKeySet(elementsToKeep)
-
-		const deletePromises: Promise<void>[] = Object.keys(this.channelMap).map(async (key) => {
-			if (elementsToKeepSet.has(key)) return
-
-			try {
-				await this.deleteElement(this.channelMap[key])
-			} catch (e) {
-				if (!(e instanceof InexistentError)) {
-					throw e
-				}
-			}
-		})
+			})
 
 		await Promise.allSettled(deletePromises) // Wait for all Promises
 		await Promise.all(deletePromises) // throw if there are any rejected Promises
@@ -508,35 +580,97 @@ ${entries}
 
 	async getElement(elementId: ElementId): Promise<VElement> {
 		await this.mse.checkConnection()
-		if (isExternalElement(elementId)) {
-			const playlistsList = await this.pep.getJS(`/storage/playlists/{${this.playlist}}/elements`, 2)
-			const flatPlaylistElements: FlatEntry = await flattenEntry(playlistsList.js as AtomEntry)
-			const elementKey = Object.keys(flatPlaylistElements.elements as FlatEntry).find((k) => {
-				const elem = (flatPlaylistElements.elements as FlatEntry)[k] as FlatEntry
-				const ref = elem.value as string
-				return ref.endsWith(`/${elementId.vcpid}`) && (!elementId.channel || elem.viz_program === elementId.channel)
-			})
-			const element =
-				typeof elementKey === 'string'
-					? ((flatPlaylistElements.elements as FlatEntry)[elementKey] as FlatEntry)
-					: undefined
-			if (!element) {
-				throw new InexistentError(
-					typeof playlistsList.id === 'number' ? playlistsList.id : 0,
-					`/storage/playlists/{${this.playlist}}/elements#${elementId.vcpid}`
-				)
-			} else {
-				element.vcpid = elementId.vcpid.toString()
-				element.channel = element.viz_program
-				element.name = elementKey && elementKey !== '0' ? elementKey.replace('#', '%23') : 'ref'
-				return element as ExternalElement
+
+		const playlistsList = await this.pep.getJS(`/storage/playlists/${wrapInBracesIfNeeded(this.playlist)}/elements`, 4)
+		const flatPlaylistElements: FlatEntry = await flattenEntry(playlistsList.js as AtomEntry)
+
+		// Helper function to find element recursively
+		const findElementRecursively = (obj: any): any => {
+			// Base case: not an object or null
+			if (!obj || typeof obj !== 'object') {
+				return null
 			}
-		} else {
-			const element = await this.pep.getJS(`/storage/shows/{${elementId.showId}}/elements/${elementId.instanceName}`)
-			const flatElement: FlatEntry = (await flattenEntry(element.js as AtomEntry))[elementId.instanceName] as FlatEntry
-			flatElement.name = elementId.instanceName
-			return flatElement as InternalElement
+
+			// Check if this is a direct reference with the matching vcpid
+			if (obj.value && typeof obj.value === 'string' && obj.value.includes(`/elements/${elementId.vcpid}`)) {
+				return {
+					vcpid: elementId.vcpid.toString(),
+					channel: obj.viz_program,
+					name: obj.key || 'ref',
+					refPath: obj.value,
+				}
+			}
+
+			// Check if this is a reference with the matching path in _
+			if (obj._ && typeof obj._ === 'string' && obj._.includes(`/elements/${elementId.vcpid}`)) {
+				return {
+					vcpid: elementId.vcpid.toString(),
+					channel: obj.viz_program || (obj.$ && obj.$.viz_program),
+					name: (obj.$ && obj.$.name) || 'ref',
+					refPath: obj._,
+				}
+			}
+
+			// Check if this is a reference with a name matching the vcpid pattern
+			if (obj.$ && obj.$.name && obj.$.name.startsWith(elementId.vcpid + '_')) {
+				// Look for the path in this object
+				if (obj._ && typeof obj._ === 'string') {
+					return {
+						vcpid: elementId.vcpid.toString(),
+						channel: obj.viz_program || (obj.$ && obj.$.viz_program),
+						name: obj.$.name,
+						refPath: obj._,
+					}
+				}
+			}
+
+			// Recursively search all properties
+			for (const key in obj) {
+				// Skip certain properties that we know aren't relevant
+				if (key === 'name' || key === 'id' || key === 'status') continue
+
+				// Handle arrays
+				if (Array.isArray(obj[key])) {
+					for (const item of obj[key]) {
+						const result = findElementRecursively(item)
+						if (result) return result
+					}
+				}
+				// Handle nested objects
+				else if (typeof obj[key] === 'object') {
+					const result = findElementRecursively(obj[key])
+					if (result) return result
+				}
+			}
+
+			return null
 		}
+
+		// Start the search from the root
+		const element = findElementRecursively(flatPlaylistElements)
+
+		if (!element) {
+			throw new InexistentError(
+				typeof playlistsList.id === 'number' ? playlistsList.id : 0,
+				`/storage/playlists/${wrapInBracesIfNeeded(this.playlist)}/elements/${elementId.vcpid}`
+			)
+		} else {
+			// Update the element map with the correct reference path
+			this.elementMap[Rundown.makeKey(elementId)] = {
+				vcpid: elementId.vcpid,
+				channel: element.channel,
+				refName: 'ref',
+			}
+
+			return element as ExternalElement
+		}
+	}
+
+	async getExternalPilotDbElement(elementId: ElementId): Promise<any> {
+		const element = await this.pep.getJS(`/external/pilotdb/elements/${elementId.vcpid}`)
+		const flatPlaylistElements: FlatEntry = await flattenEntry(element.js as AtomEntry)
+
+		return flatPlaylistElements
 	}
 
 	async isActive(): Promise<boolean> {
@@ -544,8 +678,27 @@ ${entries}
 		return playlist.active_profile && typeof playlist.active_profile.value !== 'undefined'
 	}
 
-	private getExternalElementPath(elementId: ExternalElementId, unescape = false): string {
-		return `/storage/playlists/{${this.playlist}}/elements/${this.ref(elementId, unescape)}`
+	private getExternalElementPath(elementId: ElementId, unescaped = false): string {
+		// Ensure the element map is built
+		this.checkElementMapWasBuilt().catch((err) => {
+			console.error('Failed to check element map:', getPepErrorMessage(err))
+		})
+
+		// Get the element info from the map
+		const key = Rundown.makeKey(elementId)
+		const info = this.elementMap[key]
+
+		if (!info) {
+			console.warn(`Element ${key} not found in element map, using default path`)
+			return `/storage/elements/${elementId.vcpid}`
+		}
+
+		// Check if this is an external element with a refPath
+		if ('refPath' in info && info.refPath) {
+			return unescaped ? info.refPath : encodeURIComponent(info.refPath)
+		} else {
+			return `/storage/elements/${elementId.vcpid}`
+		}
 	}
 
 	async setAlternativeConcept(value: string): Promise<void> {
@@ -555,5 +708,33 @@ ${entries}
 		// Environment entry must exists!
 		await this.pep.ensurePath(environmentPath)
 		await this.pep.replace(`${environmentPath}/${ALTERNATIVE_CONCEPT}`, alternativeConceptEntry)
+	}
+
+	private async checkElementMapWasBuilt(): Promise<void> {
+		// If we have elements in the map, we're good
+		if (Object.keys(this.elementMap).length > 0) {
+			return
+		}
+
+		// Wait for the initial build if it's in progress
+		if (this.initialElementMapPromise) {
+			try {
+				await this.initialElementMapPromise
+				console.log('Used initial element map build')
+
+				// If the map is still empty after the initial build, rebuild it
+				if (Object.keys(this.elementMap).length === 0) {
+					console.log('Element map is empty after initial build, rebuilding')
+					await this.buildElementMap()
+				}
+			} catch (err) {
+				console.warn('Initial element map build failed, rebuilding:', getPepErrorMessage(err))
+				await this.buildElementMap()
+			}
+		} else {
+			// No initial build, so build the map now
+			console.log('No initial element map build, building now')
+			await this.buildElementMap()
+		}
 	}
 }

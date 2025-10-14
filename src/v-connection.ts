@@ -136,15 +136,17 @@ export interface ExternalElementId {
 	channel?: string
 }
 
-export type ElementId = InternalElementId | ExternalElementId
-
-export function isInternalElement(elementId: ElementId): elementId is InternalElementId {
-	return (elementId as InternalElementId).instanceName !== undefined
+export interface PlaylistGroup {
+	name: string
+	description: string
+	elements: Array<{
+		name: string
+		vcpid: number | undefined
+		text: string
+	}>
 }
 
-export function isExternalElement(elementId: ElementId): elementId is ExternalElementId {
-	return (elementId as ExternalElementId).vcpid !== undefined
-}
+export type ElementId = ExternalElementId
 
 /**
  *  Representation of all the graphics associated with a Sofie rundown. A rundown object is
@@ -176,37 +178,15 @@ export interface VRundown {
 	 */
 	getTemplate(templateName: string, showId: string): Promise<VTemplate>
 	/**
-	 *  Create a new [[InternalElement|_internal_ graphical element]] that is an
-	 *  instance of the named [[VTemplate|template]].
-	 *  @param elementId Object uniquely identifying an internal or external element.
-	 *  @param templateName Name of the template the element is an instance of.
-	 *  @param textFields   List of values for each of the graphical elements.
-	 *  @param channel      Optional channel to play out this graphic. Default is the _program_.
-	 *  @returns Resolves to a newly created element.
-	 */
-	createElement(
-		elementId: InternalElementId,
-		templateName: string,
-		textFields: string[],
-		channel?: string
-	): Promise<InternalElement>
-	/**
-	 *  Create a new [[ExternalElement|_external_ graphical element]] by unique reference number.
-	 *  @param elementId Object uniquely identifying an external element.
-	 *  @returns Resolves to a newly created element reference.
-	 */
-	createElement(elementId: ExternalElementId): Promise<ExternalElement>
-	/**
-	 *  List all the internal graphical elements created for a given show.
-	 *  @param showId Name of the show to query, a UUID.
-	 *  @returns Resolves to a list of internal graphical element references.
-	 */
-	listInternalElements(showId: string): Promise<Array<InternalElementId>>
-	/**
 	 *  List all the external graphical elements created for this rundown.
 	 *  @returns Resolves to a list of external graphical element ids.
 	 */
 	listExternalElements(): Promise<Array<ExternalElementId>>
+	/**
+	 *  List all the external graphical elements created for this rundown.
+	 *  @returns Resolves to a list of external graphical element ids.
+	 */
+	listPilotDBExternalElements(): Promise<Array<PlaylistGroup>>
 	/**
 	 *  Read the details of a graphical element in this rundown.
 	 *  @param elementId Object uniquely identifying an internal or external element.
@@ -299,22 +279,6 @@ export interface VRundown {
 	 *  @returns Resolves on a successful request to cleanup.
 	 */
 	cleanupShow(showId: string): Promise<CommandResult>
-
-	cleanupAllSofieShows(): Promise<CommandResult[]>
-
-	/**
-	 *  Clear up all Internal Elements and state associated with given shows,
-	 *  including those required for post-rundown analysis.
-	 *  @param showIds Names (UUIDs) of the shows to purge.
-	 *	@param onlyCreatedByUs Restricted to removing only elements that have a matching creator attribute
-	 *  @param elementsToKeep Elements to omit from deleting.
-	 *  @result Resolves on successful rundown purge.
-	 */
-	purgeInternalElements(
-		showIds: string[],
-		onlyCreatedByUs?: boolean,
-		elementsToKeep?: InternalElementId[]
-	): Promise<PepResponse>
 	/**
 	 *  Clear up all External Elements and state associated with a rundown,
 	 *  including those required for post-rundown analysis.
