@@ -214,7 +214,7 @@ export class MSERep extends EventEmitter implements MSE {
 		if (!playlist) {
 			return false
 		}
-		if (!playlist.profile.endsWith(`/${profileName}`)) {
+		if (playlist.profile && !playlist.profile.endsWith(`/${profileName}`)) {
 			throw new Error(
 				`Referenced playlist exists but references profile '${playlist.profile}' rather than the given '${profileName}'.`
 			)
@@ -225,8 +225,10 @@ export class MSERep extends EventEmitter implements MSE {
 	private async createNewPlaylist(playlistID: string, description: string, profileName: string): Promise<void> {
 		const modifiedDate = this.getCurrentTimeFormatted()
 		await this.pep.insert(
-			`/storage/playlists/{${playlistID}}`,
-			`<playlist description="${description}" modified="${modifiedDate}" profile="/config/profiles/${profileName}" name="{${playlistID}}">
+			`/storage/playlists/${wrapInBracesIfNeeded(playlistID)}`,
+			`<playlist description="${description}" modified="${modifiedDate}" profile="/config/profiles/${profileName}" name="${wrapInBracesIfNeeded(
+				playlistID
+			)}">
     <elements/>
     <entry name="environment">
         <entry name="alternative_concept"/>
@@ -290,7 +292,7 @@ export class MSERep extends EventEmitter implements MSE {
 		if (playlist.active_profile.value) {
 			throw new Error(`Cannot delete an active profile.`)
 		}
-		const delres = await this.pep.delete(`/storage/playlists/{${rundown.playlist}}`)
+		const delres = await this.pep.delete(`/storage/playlists/${wrapInBracesIfNeeded(rundown.playlist)}`)
 		return delres.status === 'ok'
 	}
 
